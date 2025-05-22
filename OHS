@@ -1,0 +1,755 @@
+## Genetic Algorithm
+#!/usr/bin/env Rscript
+
+# Safe R environment settings
+Sys.setenv(DT_NO_SSE2 = "TRUE")   # Prevent illegal instruction on HPC
+Sys.setenv(DT_NO_AVX2 = "TRUE")
+Sys.setenv(DT_NO_AVX512 = "TRUE")
+
+library(data.table)
+
+# Safe fread wrapper
+#safe_fread <- function(file) {
+  #tryCatch(
+  #  {
+    #  message("Trying fread on: ", file)
+    #  fread(file)
+   # },
+   # error = function(e) {
+    #  message("fread failed on ", file, " - falling back to read.csv")
+
+    #return(as.data.table(read.csv(file)))
+    #}
+  #)
+#}
+safe_fread <- function(file) {
+  message("Reading ", file, " using read.csv() for safety.")
+  return(read.csv(file, sep = "\t", check.names = FALSE, stringsAsFactors=FALSE))
+}
+
+
+# --- INPUT FILE ---
+#input_file <- "preview_with_ID.txt" ## HAPLOTYPE EFFECTS FILE, EACH INDIVIDIDUAL HAS TWO COPIES OF HAPLOTYPES PER LOCUS
+#data <- fread(input_file)
+#data <- as.data.frame(data)
+data <- safe_fread("preview_with_ID.txt")
+rownames(data) <- data[[1]]
+data <- data[, -1]
+num_individuals <- nrow(data) / 2
+num_blocks <- ncol(data)
+num_to_select <- 50
+
+# Create segment matrix
+
+## build "best" per individual as the minimum of the two haplotypes
+
+segment_matrix <- matrix(0, nrow = num_individuals, ncol = num_blocks)
+for (i in 1:num_individuals) {
+  haplo1 <- as.numeric(data[2 * i - 1, ])
+  haplo2 <- as.numeric(data[2 * i, ])
+  segment_matrix[i, ] <- pmin(haplo1, haplo2)
+}
+
+## flip the sign so maximisation == minimisation of original values
+segment_matrix <- -segment_matrix
+
+individual_names <- unique(sub("_haplo[12]$", "", rownames(data)))
+rownames(segment_matrix) <- individual_names
+
+# --- FITNESS FUNCTION ---
+kemper_fitness <- function(selected_indices, segment_matrix) {
+  selected_matrix <- segment_matrix[selected_indices, , drop = FALSE]
+  total <- 0
+  for (j in seq_len(ncol(selected_matrix))) {
+    seg_vals <- selected_matrix[, j]
+    i1 <- which.max(seg_vals)
+    v1 <- seg_vals[i1]
+    seg_vals[i1] <- -Inf
+    v2 <- max(seg_vals)
+    total <- total + v1 + v2
+  }
+  return(total)
+}
+
+fitness_function <- function(selection) {
+  selected_indices <- which(selection == 1)
+  if (length(selected_indices) != num_to_select) return(-Inf)
+  return(kemper_fitness(selected_indices, segment_matrix))
+}
+
+# --- GA FUNCTIONS ---
+initialize_population <- function(pop_size, num_individuals, num_to_select) {
+  population <- matrix(0, nrow = pop_size, ncol = num_individuals)
+  for (i in 1:pop_size) {
+    indices <- sample(1:num_individuals, num_to_select)
+    population[i, indices] <- 1
+  }
+  return(population)
+}
+
+tournament_selection <- function(population, fitness_values, k) {
+  selected <- matrix(0, nrow = nrow(population), ncol = ncol(population))
+  for (i in 1:nrow(population)) {
+    participants <- sample(1:nrow(population), k, replace = TRUE)
+    best <- participants[which.max(fitness_values[participants])]
+    selected[i, ] <- population[best, ]
+  }
+  return(selected)
+}
+
+crossover_function <- function(parent1, parent2) {
+  point <- sample(1:(length(parent1) - 1), 1)
+  child1 <- c(parent1[1:point], parent2[(point + 1):length(parent2)])
+  child2 <- c(parent2[1:point], parent1[(point + 1):length(parent1)])
+  return(list(child1, child2))
+}
+
+mutation_function <- function(individual, gen, num_to_select, rate) {
+  if (runif(1) < rate) {
+    ones <- which(individual == 1)
+    zeros <- which(individual == 0)
+    if (length(ones) > 0 && length(zeros) > 0) {
+      flip_out <- sample(ones, 1)
+      flip_in <- sample(zeros, 1)
+      individual[flip_out] <- 0
+      individual[flip_in] <- 1
+    }
+  }
+  return(individual)
+}
+
+enforce_selection_size <- function(individual, num_to_select) {
+  current <- sum(individual)
+  while (current != num_to_select) {
+    if (current > num_to_select) {
+      individual[sample(which(individual == 1), 1)] <- 0
+    } else {
+      individual[sample(which(individual == 0), 1)] <- 1
+    }
+    current <- sum(individual)
+  }
+  return(individual)
+}
+
+# --- MAIN GA DRIVER ---
+run_ga <- function(params) {
+  pop_size <- as.numeric(params$pop_size)
+  num_generations <- as.numeric(params$num_generations)
+  crossover_rate <- as.numeric(params$crossover_rate)
+  mutation_rate <- as.numeric(params$mutation_rate)
+  elitism_rate <- as.numeric(params$elitism_rate)
+  tournament_size <- as.numeric(params$tournament_size)
+  stagnation_limit <- as.numeric(params$stagnation_limit)
+
+  start_time <- Sys.time()
+  population <- initialize_population(pop_size, num_individuals, num_to_select)
+  best_fitness <- numeric(num_generations)
+  mean_fitness <- numeric(num_generations)
+  stagnation_counter <- 0
+  last_best <- -Inf
+  best_individual <- NULL
+
+  for (gen in 1:num_generations) {
+    #cat(sprintf("---- Generation %d ----\n", gen))
+    fitness_values <- apply(population, 1, fitness_function)
+    best_index <- which.max(fitness_values)
+    best_fitness[gen] <- fitness_values[best_index]
+    #mean_fitness[gen] <- mean(fitness_values[is.finite(fitness_values)])
+     mean_fitness[gen] <- mean(fitness_values)
+
+    cat(sprintf("Gen %02d: Best fitness: %.4f | Mean fitness: %.4f\n", gen, best_fitness[gen], mean_fitness[gen]))
+
+    if (best_fitness[gen] > last_best) {
+      last_best <- best_fitness[gen]
+      best_individual <- population[best_index, ]
+      stagnation_counter <- 0
+    } else {
+      stagnation_counter <- stagnation_counter + 1
+      if (stagnation_counter >= stagnation_limit) {
+        cat("Stagnation detected. Reinitialising half of the population...\n")
+        for (i in 1:(pop_size / 2)) {
+          population[i, ] <- 0
+          population[i, sample(1:num_individuals, num_to_select)] <- 1
+        }
+        stagnation_counter <- 0
+      }
+    }
+
+         elites_n <- round(pop_size * elitism_rate)
+    elite_indices <- order(fitness_values, decreasing = TRUE)[1:elites_n]
+    elites <- population[elite_indices, , drop = FALSE]
+
+
+    parents <- tournament_selection(population, fitness_values, tournament_size)
+    offspring <- matrix(0, nrow = pop_size, ncol = num_individuals)
+
+    for (i in seq(1, pop_size, by = 2)) {
+      if (i == pop_size || runif(1) >= crossover_rate) {
+        offspring[i, ] <- parents[i, ]
+        if (i + 1 <= pop_size) offspring[i + 1, ] <- parents[i + 1, ]
+      } else {
+        children <- crossover_function(parents[i, ], parents[i + 1, ])
+        offspring[i, ] <- children[[1]]
+        if (i + 1 <= pop_size) offspring[i + 1, ] <- children[[2]]
+      }
+    }
+
+    for (i in 1:pop_size) {
+      offspring[i, ] <- mutation_function(offspring[i, ], gen, num_to_select, mutation_rate)
+      offspring[i, ] <- enforce_selection_size(offspring[i, ], num_to_select)
+    }
+
+    #elites_n <- max(1, round(pop_size * elitism_rate))
+    #elite_indices <- order(fitness_values, decreasing = TRUE)[1:elites_n]
+    #elites <- population[elite_indices, , drop = FALSE]
+    population <- offspring
+    population[1:elites_n, ] <- elites
+    population[1, ] <- best_individual  # Ensure best individual is preserved
+  }
+
+  selected_parents <- individual_names[which(best_individual == 1)]
+  end_time <- Sys.time()
+  time_taken <- as.numeric(difftime(end_time, start_time, units = "mins"))
+
+  cat("GA complete. Time taken:", time_taken, "minutes\n")
+  cat("Best fitness value:", last_best, "\n")
+
+  return(list(
+    metrics = data.frame(
+      generation = 1:num_generations,
+      best_fitness = best_fitness,
+      mean_fitness = mean_fitness,
+      time_minutes = time_taken
+    ),
+    parents = selected_parents,
+    runtime = time_taken,
+    param_string = paste0("pop", pop_size, "_gen", num_generations,
+                          "_cx", crossover_rate, "_mut", mutation_rate,
+                          "_elite", elitism_rate)
+  ))
+}
+
+# --- RUN FOR PARAMETER SET ---
+param_grid <- read.csv("parameter_grid.csv", check.names = FALSE, stringsAsFactors = FALSE)
+args <- commandArgs(trailingOnly = TRUE)
+task_id <- as.integer(args[1])
+cat("Running GA for task_id:", task_id, "\n")
+
+if (is.na(task_id) || task_id < 1 || task_id > nrow(param_grid)) {
+  stop("Invalid task_id: ", task_id)
+}
+
+params <- as.list(param_grid[task_id, ])
+cat("Running GA for task_id", task_id, "with parameters:\n")
+print(params)
+
+res <- run_ga(params)
+
+dir.create("GA_param_results", showWarnings = FALSE)
+metrics_file <- paste0("GA_param_results/results_", res$param_string, ".csv")
+parents_file <- paste0("GA_param_results/parents_", res$param_string, ".txt")
+
+write.csv(res$metrics, metrics_file, row.names = FALSE)
+writeLines(res$parents, parents_file)
+####################################
+## Differential Evolution
+#!/usr/bin/env Rscript
+# run_de_kemper.R - DE optimization of Kemper fitness using a parameter grid
+
+Sys.setenv(DT_NO_SSE2 = "TRUE", DT_NO_AVX2 = "TRUE", DT_NO_AVX512 = "TRUE")
+
+suppressMessages({
+  library(data.table)
+})
+
+# Read args
+args <- commandArgs(trailingOnly = TRUE)
+taskID <- as.integer(args[1])
+if (is.na(taskID)) stop("Need task ID as integer")
+
+# Load parameter grid
+param_grid <- read.csv("de_parameter_grid.csv")
+if (taskID < 1 || taskID > nrow(param_grid)) stop("taskID out of range")
+params <- param_grid[taskID, ]
+
+# Extract parameters
+pop_size        <- as.integer(params$pop_size)
+num_generations <- as.integer(params$num_generations)
+F_initial       <- as.numeric(params$F_initial)
+CR_initial      <- as.numeric(params$CR_initial)
+
+input_file    <- "preview_with_ID.txt"
+num_to_select <- 50
+
+# Load data
+safe_fread <- function(file) {
+  message("Reading ", file)
+  read.csv(file, sep = "\t", header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
+}
+data <- safe_fread(input_file)
+rownames(data) <- data[[1]]
+data <- data[, -1]
+num_indiv <- nrow(data) / 2
+num_blocks <- ncol(data)
+
+# Prepare segment matrix
+segment_matrix <- matrix(0, nrow = num_indiv, ncol = num_blocks)
+for (i in seq_len(num_indiv)) {
+  h1 <- as.numeric(data[2*i - 1, ])
+  h2 <- as.numeric(data[2*i    , ])
+  segment_matrix[i, ] <- -pmin(h1, h2)
+}
+individual_names <- unique(sub("_haplo[12]$", "", rownames(data)))
+rownames(segment_matrix) <- individual_names
+
+# Fitness function
+kemper_fitness <- function(idxs, segmat) {
+  sel <- segmat[idxs, , drop = FALSE]
+  total <- 0
+  for (j in seq_len(ncol(sel))) {
+    v1 <- max(sel[, j])
+    sel[, j][which.max(sel[, j])] <- -Inf
+    v2 <- max(sel[, j])
+    total <- total + v1 + v2
+  }
+  total
+}
+
+fitness_function <- function(x) {
+  sel <- which(x > 0.5)
+  if (length(sel) != num_to_select) return(-Inf)
+  kemper_fitness(sel, segment_matrix)
+}
+
+enforce_selection <- function(x) {
+  sel <- which(x > 0.5)
+  if (length(sel) < num_to_select) {
+    to_add <- sample(which(x <= 0.5), num_to_select - length(sel))
+    x[to_add] <- 1
+  } else if (length(sel) > num_to_select) {
+    to_rm <- sample(sel, length(sel) - num_to_select)
+    x[to_rm] <- 0
+  }
+  x
+}
+
+# DE functions
+create_initial_population <- function(pop_size, num_indiv, num_to_select) {
+  pop <- matrix(runif(pop_size * num_indiv), nrow = pop_size)
+  t(apply(pop, 1, enforce_selection))
+}
+
+adaptive_mutation <- function(F_initial, CR_initial, best, a, b, c, lower, upper, pop, i) {
+  F_i <- F_initial * (0.9 + runif(1, -0.1, 0.1))
+  CR_i <- CR_initial * (0.9 + runif(1, -0.1, 0.1))
+  strategies <- list(
+    "rand/1" = function() a + F_i * (b - c),
+    "best/1" = function() best + F_i * (b - c),
+    "rand/2" = function() a + F_i * (b - c + pop[sample(nrow(pop),1), ] - pop[sample(nrow(pop),1), ]),
+    "current-to-best/1" = function() pop[i, ] + F_i * (best - pop[i, ]) + F_i * (b - c)
+  )
+  mutant <- strategies[[sample(names(strategies), 1)]]()
+  pmin(pmax(mutant, lower), upper)
+}
+
+custom_de <- function() {
+  pop <- create_initial_population(pop_size, num_indiv, num_to_select)
+  best_fitness <- numeric(num_generations)
+  best_individual <- NULL
+
+  for (gen in 1:num_generations) {
+    fit_vals <- apply(pop, 1, fitness_function)
+    best_idx <- which.max(fit_vals)
+    best_individual <- pop[best_idx, ]
+
+    new_pop <- pop
+    for (i in 1:nrow(pop)) {
+      idxs <- sample(setdiff(1:nrow(pop), i), 3)
+      a <- pop[idxs[1], ]; b <- pop[idxs[2], ]; c <- pop[idxs[3], ]
+      mutant <- adaptive_mutation(F_initial, CR_initial, best_individual, a, b, c, rep(0, num_indiv), rep(1, num_indiv), pop, i)
+      trial <- ifelse(runif(num_indiv) < CR_initial, mutant, pop[i, ])
+      trial <- enforce_selection(trial)
+      trial_fit <- fitness_function(trial)
+      if (trial_fit > fit_vals[i]) new_pop[i, ] <- trial
+    }
+
+    pop <- new_pop
+    fit_vals <- apply(pop, 1, fitness_function)
+    best_fitness[gen] <- max(fit_vals)
+    cat(sprintf("Generation %3d | Best Fitness = %.4f | Mean Fitness = %.4f
+", gen, best_fitness[gen], mean(fit_vals)))
+  }
+
+  list(best = best_individual, history = best_fitness)
+}
+
+# Run and save
+start_time <- Sys.time()
+res <- custom_de()
+end_time <- Sys.time()
+time_taken <- round(as.numeric(difftime(end_time, start_time, units = "mins")), 3)
+
+out_dir <- "DE_param_results"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+id_str <- sprintf("pop%d_gen%d_F%.1f_CR%.1f", pop_size, num_generations, F_initial, CR_initial)
+
+write.csv(data.frame(iter = seq_len(num_generations), best = res$history),
+          file.path(out_dir, paste0("de_kemper_fitness_", id_str, ".csv")), row.names = FALSE)
+
+writeLines(individual_names[which(res$best > 0.5)],
+           file.path(out_dir, paste0("de_kemper_parents_", id_str, ".txt")))
+
+cat("Done. Best Fitness:", max(res$history), "Time (mins):", time_taken, "\n")
+############################################################################
+## Particle Swarm Optimisation
+#!/usr/bin/env Rscript
+# run_pso_kemper.R
+# PSO optimization of Kemper fitness, array-ready via SLURM
+
+# — safe environment
+Sys.setenv(
+  DT_NO_SSE2   = "TRUE",
+  DT_NO_AVX2   = "TRUE",
+  DT_NO_AVX512 = "TRUE"
+)
+
+suppressMessages({
+  library(data.table)    # for fread fallback
+})
+
+# safe fread (tab-delim) fallback
+safe_fread <- function(file) {
+  message("Reading ", file, " via read.csv")
+  read.csv(file, sep = "\t", header = TRUE,
+           check.names = FALSE,
+           stringsAsFactors = FALSE)
+}
+
+# — PARAMETERS / SLURM ARRAY ID
+args   <- commandArgs(trailingOnly = TRUE)
+taskID <- as.integer(args[1])
+if (is.na(taskID)) stop("Need one integer argument: task ID")
+
+# read the grid of PSO parameters
+# expected columns: pop_size, num_generations, c1, c2, w_start, w_end
+param_grid <- read.csv("pso_parameter_grid.csv",
+                       check.names = FALSE,
+                       stringsAsFactors = FALSE)
+if (taskID < 1 || taskID > nrow(param_grid)) {
+  stop("taskID out of range [1,", nrow(param_grid), "]")
+}
+params <- param_grid[taskID, ]
+print(params)
+
+# unpack
+pop_size        <- as.integer(params$pop_size)
+num_generations <- as.integer(params$num_generations)
+c1              <- as.numeric(params$c1)
+c2              <- as.numeric(params$c2)
+w_start         <- as.numeric(params$w_start)
+w_end           <- as.numeric(params$w_end)
+
+# fixed
+input_file    <- "preview_with_ID.txt"
+num_to_select <- 50
+
+# — LOAD & PREP DATA
+data         <- safe_fread(input_file)
+rownames(data) <- data[[1]]
+data         <- data[, -1]
+num_indiv    <- nrow(data) / 2
+num_blocks   <- ncol(data)
+
+# build segment_matrix: pmin of the two haplotypes, then negate
+segment_matrix <- matrix(0, nrow = num_indiv, ncol = num_blocks)
+for (i in seq_len(num_indiv)) {
+  h1 <- as.numeric(data[2*i - 1, ])
+  h2 <- as.numeric(data[2*i    , ])
+  segment_matrix[i, ] <- -pmin(h1, h2)
+}
+individual_names <- unique(sub("_haplo[12]$", "", rownames(data)))
+rownames(segment_matrix) <- individual_names
+
+# — FITNESS: Kemper
+kemper_fitness <- function(idxs, segmat) {
+  sel <- segmat[idxs, , drop = FALSE]
+  total <- 0
+  for (j in seq_len(ncol(sel))) {
+    v1 <- max(sel[, j])
+    sel[, j][which.max(sel[, j])] <- -Inf
+    v2 <- max(sel[, j])
+    total <- total + v1 + v2
+  }
+  total
+}
+
+fitness_function <- function(x) {
+  sel <- which(x > 0.5)
+  if (length(sel) != num_to_select) return(-Inf)
+  kemper_fitness(sel, segment_matrix)
+}
+
+# — CONSTRAINT: enforce exactly num_to_select ones
+enforce_sel <- function(x) {
+  sel <- which(x > 0.5)
+  if (length(sel) < num_to_select) {
+    to_add <- sample(which(x <= 0.5), num_to_select - length(sel))
+    x[to_add] <- 1
+  } else if (length(sel) > num_to_select) {
+    to_rm <- sample(sel, length(sel) - num_to_select)
+    x[to_rm] <- 0
+  }
+  x
+}
+
+# — CUSTOM PSO (sequential)
+custom_pso <- function(par, fn, lower, upper,
+                       maxit, w_start, w_end, c1, c2) {
+  s         <- nrow(par)
+  pbest     <- par
+  pbest_val <- apply(par, 1, fn)
+  gbest_i   <- which.max(pbest_val)
+  gbest     <- pbest[gbest_i, ]
+  gbest_val <- pbest_val[gbest_i]
+
+  v           <- matrix(0, nrow = s, ncol = ncol(par))
+  w_seq       <- seq(w_start, w_end, length.out = maxit)
+  fitness_hist<- numeric(maxit)
+
+  for (i in seq_len(maxit)) {
+    fitness_values <- numeric(s)
+    for (j in seq_len(s)) {
+      par[j, ]          <- enforce_sel(par[j, ])
+      fitness_values[j] <- fn(par[j, ])
+    }
+    # update personal bests
+    improved <- fitness_values > pbest_val
+    if (any(improved)) {
+      pbest[improved, ]   <- par[improved, ]
+      pbest_val[improved] <- fitness_values[improved]
+    }
+    # update global best
+    idx <- which.max(pbest_val)
+    if (pbest_val[idx] > gbest_val) {
+      gbest_val <- pbest_val[idx]
+      gbest     <- pbest[idx, ]
+    }
+    fitness_hist[i] <- gbest_val
+    cat(sprintf("Iter %3d | best=%.4f\n", i, gbest_val))
+
+    # update velocities & positions
+    for (j in seq_len(s)) {
+      r1 <- runif(ncol(par)); r2 <- runif(ncol(par))
+      v[j, ] <- w_seq[i] * v[j, ] +
+                c1 * r1 * (pbest[j, ] - par[j, ]) +
+                c2 * r2 * (gbest - par[j, ])
+      par[j, ] <- pmax(pmin(par[j, ] + v[j, ], upper), lower)
+      par[j, ] <- enforce_sel(par[j, ])
+    }
+  }
+  list(gbest = gbest, value = gbest_val, history = fitness_hist)
+}
+
+# — RUN PSO
+set.seed(123)
+lower   <- rep(0, num_indiv)
+upper   <- rep(1, num_indiv)
+initial <- matrix(runif(pop_size * num_indiv), nrow = pop_size)
+initial <- t(apply(initial, 1, enforce_sel))
+
+t0 <- Sys.time()
+res<- custom_pso(initial, fitness_function,
+                 lower, upper,
+                 maxit = num_generations,
+                 w_start, w_end, c1, c2)
+t1 <- Sys.time()
+
+# — OUTPUT
+out_dir <- "PSO_param_results"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+# metrics
+df_metrics <- data.frame(
+  iter = seq_len(num_generations),
+  best = res$history
+)
+metrics_file <- file.path(out_dir,
+  sprintf("pso_pop%d_gen%d_c1%.1f_c2%.1f.csv",
+          pop_size, num_generations, c1, c2)
+)
+write.csv(df_metrics, metrics_file, row.names = FALSE)
+
+# selected parents
+parents <- individual_names[which(res$gbest > 0.5)]
+parents_file <- file.path(out_dir,
+  sprintf("parents_pop%d_gen%d_c1%.1f_c2%.1f.txt",
+          pop_size, num_generations, c1, c2)
+)
+writeLines(parents, parents_file)
+
+cat("Done. Time (mins):", difftime(t1, t0, units = "mins"), "\n")
+##############################
+## Simulated Annealing
+#!/usr/bin/env Rscript
+# run_sa_kemper.R - Simulated Annealing optimization using Kemper fitness, SLURM-ready
+
+Sys.setenv(
+  DT_NO_SSE2   = "TRUE",
+  DT_NO_AVX2   = "TRUE",
+  DT_NO_AVX512 = "TRUE"
+)
+
+suppressMessages({
+  library(data.table)
+})
+
+safe_fread <- function(file) {
+  message("Reading ", file, " via read.csv")
+  read.csv(file, sep = "\t", header = TRUE,
+           check.names = FALSE,
+           stringsAsFactors = FALSE)
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+taskID <- as.integer(args[1])
+if (is.na(taskID)) stop("Need one integer argument: task ID")
+
+# Read parameter grid
+param_grid <- read.csv("sa_parameter_grid.csv", check.names = FALSE, stringsAsFactors = FALSE)
+if (taskID < 1 || taskID > nrow(param_grid)) stop("taskID out of range")
+params <- param_grid[taskID, ]
+
+# Parameters
+initial_temp      <- as.numeric(params$initial_temp)
+cooling_rate      <- as.numeric(params$cooling_rate)
+max_temps         <- as.integer(params$max_temps)
+iterations_per_temp <- 10  # fixed
+
+# Fixed
+input_file    <- "preview_with_ID.txt"
+num_to_select <- 50
+
+# Load and prep data
+raw_data <- safe_fread(input_file)
+rownames(raw_data) <- raw_data[[1]]
+data <- raw_data[, -1]
+num_indiv <- nrow(data) / 2
+num_blocks <- ncol(data)
+
+segment_matrix <- matrix(0, nrow = num_indiv, ncol = num_blocks)
+for (i in seq_len(num_indiv)) {
+  h1 <- as.numeric(data[2*i - 1, ])
+  h2 <- as.numeric(data[2*i    , ])
+  segment_matrix[i, ] <- -pmin(h1, h2)
+}
+individual_names <- unique(sub("_haplo[12]$", "", rownames(raw_data)))
+rownames(segment_matrix) <- individual_names
+
+# Fitness
+kemper_fitness <- function(idxs, segmat) {
+  sel <- segmat[idxs, , drop = FALSE]
+  total <- 0
+  for (j in seq_len(ncol(sel))) {
+    v1 <- max(sel[, j])
+    sel[, j][which.max(sel[, j])] <- -Inf
+    v2 <- max(sel[, j])
+    total <- total + v1 + v2
+  }
+  total
+}
+
+fitness_function <- function(x) {
+  sel <- which(x > 0.5)
+  if (length(sel) != num_to_select) return(-Inf)
+  kemper_fitness(sel, segment_matrix)
+}
+
+enforce_selection <- function(x, num_to_select) {
+  sel <- which(x > 0.5)
+  if (length(sel) < num_to_select) {
+    to_add <- sample(which(x <= 0.5), num_to_select - length(sel))
+    x[to_add] <- 1
+  } else if (length(sel) > num_to_select) {
+    to_rm <- sample(sel, length(sel) - num_to_select)
+    x[to_rm] <- 0
+  }
+  x
+}
+
+simulated_annealing <- function(fn, initial_solution, control) {
+  max_temps <- control$max_temps
+  iterations_per_temp <- control$iterations_per_temp
+  initial_temp <- control$initial_temp
+  cooling_rate <- control$cooling_rate
+
+  current <- enforce_selection(initial_solution, num_to_select)
+  current_val <- fn(current)
+  best <- current
+  best_val <- current_val
+
+  total_iter <- max_temps * iterations_per_temp
+  fitness_history <- numeric(total_iter)
+  mean_fitness_history <- numeric(max_temps)
+  iter <- 1
+
+  for (t in 1:max_temps) {
+    temp <- initial_temp * cooling_rate^(t - 1)
+    vals <- numeric(iterations_per_temp)
+
+    for (i in 1:iterations_per_temp) {
+      neighbor <- current
+      idx <- sample(length(current), 1)
+      neighbor[idx] <- 1 - neighbor[idx]
+      neighbor <- enforce_selection(neighbor, num_to_select)
+      neighbor_val <- fn(neighbor)
+
+      if (neighbor_val > current_val || runif(1) < exp(min((neighbor_val - current_val) / temp, 700))) {
+        current <- neighbor
+        current_val <- neighbor_val
+      }
+
+      if (current_val > best_val) {
+        best <- current
+        best_val <- current_val
+      }
+
+      fitness_history[iter] <- best_val
+      vals[i] <- current_val
+      iter <- iter + 1
+    }
+
+    mean_fitness_history[t] <- mean(vals)
+  }
+
+  list(solution = best, value = best_val, history = fitness_history, mean_history = mean_fitness_history)
+}
+
+# Run SA
+set.seed(taskID)
+initial_solution <- runif(num_indiv)
+start_time <- Sys.time()
+res <- simulated_annealing(fitness_function, initial_solution, list(
+  max_temps = max_temps,
+  iterations_per_temp = iterations_per_temp,
+  initial_temp = initial_temp,
+  cooling_rate = cooling_rate
+))
+end_time <- Sys.time()
+time_taken <- as.numeric(difftime(end_time, start_time, units = "mins"))
+
+# Save results
+out_dir <- "SA_param_results"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+id_str <- sprintf("temps%d_iter%d_temp%.2f_cool%.2f", max_temps, iterations_per_temp, initial_temp, cooling_rate)
+
+write.csv(data.frame(iter = seq_along(res$history), best_fitness = res$history),
+          file.path(out_dir, paste0("sa_fitness_", id_str, ".csv")), row.names = FALSE)
+
+write.csv(data.frame(temp_level = seq_along(res$mean_history), mean_fitness = res$mean_history),
+          file.path(out_dir, paste0("sa_mean_", id_str, ".csv")), row.names = FALSE)
+
+writeLines(individual_names[which(res$solution > 0.5)],
+           file.path(out_dir, paste0("sa_parents_", id_str, ".txt")))
+
+cat("Done. Best Fitness:", res$value, "Time (mins):", round(time_taken, 3), "\n")
