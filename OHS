@@ -43,33 +43,13 @@ num_to_select <- 50
 
 ## build "best" per individual as the minimum of the two haplotypes
 
-segment_matrix <- matrix(0, nrow = num_individuals, ncol = num_blocks)
-for (i in 1:num_individuals) {
-  haplo1 <- as.numeric(data[2 * i - 1, ])
-  haplo2 <- as.numeric(data[2 * i, ])
-  segment_matrix[i, ] <- pmin(haplo1, haplo2)
-}
-
-## flip the sign so maximisation == minimisation of original values
-segment_matrix <- -segment_matrix
 
 individual_names <- unique(sub("_haplo[12]$", "", rownames(data)))
 rownames(segment_matrix) <- individual_names
 
 # --- FITNESS FUNCTION ---
-kemper_fitness <- function(selected_indices, segment_matrix) {
-  selected_matrix <- segment_matrix[selected_indices, , drop = FALSE]
-  total <- 0
-  for (j in seq_len(ncol(selected_matrix))) {
-    seg_vals <- selected_matrix[, j]
-    i1 <- which.max(seg_vals)
-    v1 <- seg_vals[i1]
-    seg_vals[i1] <- -Inf
-    v2 <- max(seg_vals)
-    total <- total + v1 + v2
-  }
-  return(total)
-}
+## kemper_fitness <- OHS
+## Optimal Population Value <- OPV
 
 fitness_function <- function(selection) {
   selected_indices <- which(selection == 1)
@@ -753,3 +733,27 @@ writeLines(individual_names[which(res$solution > 0.5)],
            file.path(out_dir, paste0("sa_parents_", id_str, ".txt")))
 
 cat("Done. Best Fitness:", res$value, "Time (mins):", round(time_taken, 3), "\n")
+########################################################################################################################
+#s_matrix <- matrix(0, nrow = num_individuals, ncol = num_blocks)
+#for (i in 1:num_individuals) {
+ # haplo1 <- as.numeric(data[2 * i - 1, ])
+ # haplo2 <- as.numeric(data[2 * i, ])
+ # s_matrix[i, ] <- pmin(haplo1, haplo2)
+#}
+
+## flip the sign so maximisation == minimisation of original values
+#segment_matrix <- -segment_matrix
+
+kfitness <- function(selected_indices, segment_matrix) {
+  selected_matrix <- segment_matrix[selected_indices, , drop = FALSE]
+  total <- 0
+  for (j in seq_len(ncol(selected_matrix))) {
+    seg_vals <- selected_matrix[, j]
+    i1 <- which.max(seg_vals)
+    v1 <- seg_vals[i1]
+    seg_vals[i1] <- -Inf
+    v2 <- max(seg_vals)
+    total <- total + v1 + v2
+  }
+  return(total)
+}
