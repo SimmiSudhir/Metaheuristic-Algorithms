@@ -744,7 +744,7 @@ cat("Done. Best Fitness:", res$value, "Time (mins):", round(time_taken, 3), "\n"
 ## flip the sign so maximisation == minimisation of original values
 #segment_matrix <- -segment_matrix
 
-kfitness <- function(selected_indices, segment_matrix) {
+fitness_new <- function(selected_indices, segment_matrix) {
   selected_matrix <- segment_matrix[selected_indices, , drop = FALSE]
   total <- 0
   for (j in seq_len(ncol(selected_matrix))) {
@@ -757,3 +757,5 @@ kfitness <- function(selected_indices, segment_matrix) {
   }
   return(total)
 }
+##########################################################################################################
+# 
